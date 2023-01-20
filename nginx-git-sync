@@ -1,0 +1,182 @@
+#!/bin/bash
+
+shopt -s expand_aliases
+
+alias log='logf ${BASH_SOURCE##*/}:${LINENO} ${FUNCNAME:-main} '
+alias run_or_fail='run_or_failf ${BASH_SOURCE##*/}:${LINENO} ${FUNCNAME:-main} '
+alias run_or_error='run_or_errorf ${BASH_SOURCE##*/}:${LINENO} ${FUNCNAME:-main} '
+
+declare -A levels=([debug]=0 [info]=1 [warn]=2 [error]=3 [fatal]=4)
+declare -A log_fds=([debug]=1 [info]=1 [warn]=1 [error]=2 [fatal]=2)
+
+script_logging_level="debug"
+
+function assoc2json {
+    local -n v=$1
+    printf '%s\0' "${!v[@]}" "${v[@]}" |
+    jq -c -Rs 'split("\u0000") | . as $v | (length / 2) as $n | reduce range($n) as $idx ({}; .[$v[$idx]]=$v[$idx+$n])'
+}
+
+function logf {
+	local file_line=${1}
+	local func_name=${2}
+	local log_level=${3}
+	
+	local ignored typ
+    	read ignored typ ignored < <(declare -p ${4} 2>&1)
+    	if [ "$typ" ] && [ -z "${typ//-*A*}" ]; then
+		local -n log_json_ref=${4}
+	else
+		local -A log_json_ref=( [msg]=${4} )
+	fi
+
+	#check if level exists
+	[[ ${levels[$log_level]} ]] || return 1
+
+	#check if level is enough
+	(( ${levels[$log_level]} < ${levels[$script_logging_level]} )) && return 2
+	
+	log_json_ref["file_line"]="${file_line}"
+	log_json_ref["func_name"]="${func_name}"
+	log_json_ref["log_level"]="${log_level}"
+	log_json_ref["time_iso8601"]="$(date +'%Y-%m-%dT%H:%M:%S%:z')"
+	log_fd=${log_fds[$log_level]}
+	echo $(assoc2json log_json_ref) >&$log_fd
+
+	if [ $log_level == "fatal" ]; then
+		exit 1
+	fi
+}
+
+function last_commit_hash {
+	local args=( "--format=%H" "-n" "1" )
+	if [ ${1} ]; then
+		args+=( ${1} )
+	fi
+	git log ${args[@]}
+}
+
+function git_remote_server_url {
+	local remote_url=$(git config --get remote.origin.url)
+	local proto="$(echo "${remote_url}" | grep :// | sed -e's,^\(.*://\).*,\1,g')"
+	local domain=$(echo "${remote_url}" | sed -e 's/[^/]*\/\/\([^@]*@\)\?\([^:/]*\).*/\2/')
+	echo "${proto}${domain}"
+}
+
+function gitlab_avatar_url {
+	local email=${1}
+	local url="$(git_remote_server_url)/api/v4/avatar?email=${email}&size=48"
+	local avatar_response=$(curl --fail -s "${url}")
+	local avatar_url=$(echo "${avatar_response}" | jq -r '.avatar_url')
+	echo $avatar_url
+}
+
+function commit_info {
+	declare -A ret=()
+	ret["commit"]="${1}"
+	ret["commit_short"]=$(git show -s --format='%h' "${ret[commit]}")
+	ret["author_email"]=$(git show -s --format='%ae' "${ret[commit]}")
+	ret["author_name"]=$(git show -s --format='%an' "${ret[commit]}")
+	ret["commit_message"]=$(git show -s --format='%s' "${ret[commit]}")
+	ret["commit_diff"]=$(git diff --shortstat ${ret[commit]} $2)
+	local author_avatar_url=$(gitlab_avatar_url "${ret[author_email]}")
+	if [ $? -eq 0 ]; then
+		ret["author_avatar_url"]="${author_avatar_url}"
+	fi
+
+	echo '('
+    	for key in  "${!ret[@]}" ; do
+        	echo "['$key']='${ret[$key]}'"
+    	done
+    	echo ')'
+}
+
+function catch {
+	eval "$({
+	__2="$(
+	  { __1="$("${@:3}")"; } 2>&1;
+	  ret=$?;
+	  printf '%q=%q\n' "$1" "$__1" >&2;
+	  exit $ret
+	  )";
+	ret="$?";
+	printf '%s=%q\n' "$2" "$__2" >&2;
+	printf '( exit %q )' "$ret" >&2;
+	} 2>&1 )" >/dev/null 2>&1;
+}
+
+function run_or_log {
+	local command="${@:4}"
+	catch stdout stderr ${@:4}
+	local ret=$?
+	declare -A dict=(
+		["cmd"]="${@:4}"
+		["exit_code"]="$?"
+		["stdout"]="${stdout}"
+		["stderr"]="${stderr}"
+	)
+
+	if [ $ret -ne 0 ]; then
+		dict["msg"]="error executing command \"${command}\""
+		logf "${1}" "${2}" "${3}" dict
+		return "${ret}"
+	fi
+	dict["msg"]="command \"${command}\" successfuly completed"
+	logf "${1}" "${2}" debug dict
+}
+
+
+function run_or_failf {
+	run_or_log ${1} ${2} fatal ${@:3}
+	return $?
+}
+
+function run_or_errorf {
+	run_or_log ${1} ${2} error ${@:3}
+	return $?
+}
+
+
+run_or_fail "git rev-parse --is-inside-work-tree"
+
+declare -A dict="$(commit_info $(last_commit_hash))"
+dict["status"]="starting"
+dict["action"]="check_current_commit"
+dict["msg"]="starting nginx config synchronization"
+log info dict
+
+prev_remote_commit="$(last_commit_hash origin/master)"
+
+run_or_fail "git fetch"
+
+new_remote_commit=$(last_commit_hash origin/master)
+
+if [ "${new_remote_commit}" == "${prev_remote_commit}" ]; then
+	log info "no changes in remote: local and remote hashs are both ${prev_remote_commit}"
+	exit
+fi
+
+prev_local_commit=$(last_commit_hash)
+
+log info "merging changes into local"
+
+run_or_fail "git merge"
+
+if ! run_or_error "nginx -t"; then
+	log info "reseting to ${prev_local_commit}"
+	run_or_error "git reset --hard ${prev_local_commit}"
+	exit 1
+fi
+
+if ! run_or_error "nginx -s reload"; then
+	log info "reseting to ${prev_local_commit}"
+	run_or_error "git reset --hard ${prev_local_commit}"
+	run_or_error "nginx -s reload"
+	exit 1
+fi
+
+declare -A dict="$(commit_info $(last_commit_hash))"
+dict["status"]="success"
+dict["action"]="apply_changes"
+dict["msg"]="successfuly applied new changes"
+log info dict
